@@ -1,0 +1,387 @@
+name: Build Godot APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+
+      - name: Unpack game.zip
+        shell: bash
+        run: |
+          set -e
+
+          rm -rf game
+          mkdir -p game
+
+          unzip -q game.zip -d game
+
+          if [ -f "game/project.godot" ]; then
+            GAME_DIR="game"
+          else
+            PROJECT_FILE=$(find game -type f -name "project.godot" | head -n 1)
+
+            if [ -z "$PROJECT_FILE" ]; then
+              echo "ERROR: project.godot not found inside game.zip"
+              find game -maxdepth 4 -type f | head -100
+              exit 1
+            fi
+
+            GAME_DIR=$(dirname "$PROJECT_FILE")
+          fi
+
+          echo "GAME_DIR=$GAME_DIR" >> "$GITHUB_ENV"
+
+          echo "Project directory:"
+          echo "$GAME_DIR"
+
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+
+      - name: Install Android packages
+        shell: bash
+        run: |
+          set -e
+
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+
+      - name: Start Android ADB
+        shell: bash
+        run: |
+          set -e
+
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+
+          echo "ADB:"
+          adb version
+
+          echo "Starting ADB daemon..."
+          adb start-server
+
+          echo "ADB devices:"
+          adb devices
+
+
+      - name: Download Godot 4.6
+        shell: bash
+        run: |
+          set -e
+
+          GODOT_URL="https://github.com/godotengine/godot-builds/releases/download/4.6-stable/Godot_v4.6-stable_linux.x86_64.zip"
+
+          echo "Downloading Godot..."
+          curl -fL "$GODOT_URL" -o godot.zip
+
+          rm -rf godot-dist
+          mkdir -p godot-dist
+
+          echo "Extracting Godot..."
+          unzip -q godot.zip -d godot-dist
+
+          echo "Extracted files:"
+          ls -lah godot-dist
+
+          GODOT_BIN="godot-dist/Godot_v4.6-stable_linux.x86_64"
+
+          if [ ! -f "$GODOT_BIN" ]; then
+            echo "ERROR: Godot executable not found."
+            find godot-dist -maxdepth 3 -type f -print
+            exit 1
+          fi
+
+          chmod +x "$GODOT_BIN"
+
+          cp "$GODOT_BIN" "$GITHUB_WORKSPACE/godot"
+          chmod +x "$GITHUB_WORKSPACE/godot"
+
+          echo "Godot version:"
+          "$GITHUB_WORKSPACE/godot" --version
+
+
+      - name: Download Android export templates
+        shell: bash
+        run: |
+          set -e
+
+          TEMPLATE_URL="https://github.com/godotengine/godot-builds/releases/download/4.6-stable/Godot_v4.6-stable_export_templates.tpz"
+
+          echo "Downloading export templates..."
+          curl -fL "$TEMPLATE_URL" -o templates.tpz
+
+          EXPORT_ROOT="$HOME/.local/share/godot/export_templates"
+          TEMP_TEMPLATES="$EXPORT_ROOT/temp"
+
+          rm -rf "$TEMP_TEMPLATES"
+          mkdir -p "$TEMP_TEMPLATES"
+
+          echo "Extracting TPZ..."
+          unzip -q templates.tpz -d "$TEMP_TEMPLATES"
+
+          rm -rf "$EXPORT_ROOT/4.6.stable"
+
+          if [ -d "$TEMP_TEMPLATES/templates" ]; then
+            mv "$TEMP_TEMPLATES/templates" "$EXPORT_ROOT/4.6.stable"
+          else
+            echo "ERROR: templates directory not found."
+            find "$TEMP_TEMPLATES" -maxdepth 3 -type f
+            exit 1
+          fi
+
+          rm -rf "$TEMP_TEMPLATES"
+
+          echo "Templates installed:"
+          find "$EXPORT_ROOT/4.6.stable" -maxdepth 2 -type f | head -30
+
+
+      - name: Create Android debug keystore
+        shell: bash
+        run: |
+          set -e
+
+          DEBUG_DIR="$HOME/.android"
+          DEBUG_KEYSTORE="$DEBUG_DIR/debug.keystore"
+
+          mkdir -p "$DEBUG_DIR"
+
+          if [ ! -f "$DEBUG_KEYSTORE" ]; then
+            echo "Creating Android debug keystore..."
+
+            keytool -genkeypair \
+              -v \
+              -keystore "$DEBUG_KEYSTORE" \
+              -alias androiddebugkey \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass android \
+              -keypass android \
+              -dname "CN=Android Debug,O=Android,C=US" \
+              -noprompt
+          else
+            echo "Debug keystore already exists."
+          fi
+
+          echo "DEBUG_KEYSTORE=$DEBUG_KEYSTORE" >> "$GITHUB_ENV"
+
+          echo "Keystore:"
+          ls -lh "$DEBUG_KEYSTORE"
+
+
+      - name: Configure Godot Android paths
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p "$HOME/.config/godot"
+
+          cat > "$HOME/.config/godot/editor_settings-4.tres" <<EOF
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/java_sdk_path = "${JAVA_HOME}"
+          export/android/sdk_path = "${ANDROID_HOME}"
+          export/android/debug_keystore = "${DEBUG_KEYSTORE}"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          EOF
+
+          echo "Godot Android paths configured."
+          echo "Java: $JAVA_HOME"
+          echo "SDK: $ANDROID_HOME"
+          echo "Keystore: $DEBUG_KEYSTORE"
+
+
+      - name: Prepare Android export preset
+        shell: bash
+        run: |
+          set -e
+
+          cd "$GAME_DIR"
+
+          python3 - "$DEBUG_KEYSTORE" <<'PY'
+          from pathlib import Path
+          import sys
+
+          keystore = sys.argv[1]
+          path = Path("export_presets.cfg")
+
+          if not path.exists():
+              raise SystemExit("ERROR: export_presets.cfg not found")
+
+          text = path.read_text()
+
+          # Ensure Android preset exists.
+          if 'platform="Android"' not in text:
+              raise SystemExit("ERROR: Android export preset not found")
+
+          lines = text.splitlines()
+
+          # Find Android preset options section.
+          options_index = None
+
+          for i, line in enumerate(lines):
+              if line.strip() == "[preset.0.options]":
+                  options_index = i
+                  break
+
+          if options_index is None:
+              raise SystemExit("ERROR: [preset.0.options] not found")
+
+          def set_option(key, value):
+              global lines
+
+              for i in range(options_index + 1, len(lines)):
+                  if lines[i].startswith("[") and lines[i].endswith("]"):
+                      break
+
+                  if lines[i].startswith(key + "="):
+                      lines[i] = key + "=" + value
+                      return
+
+              lines.insert(options_index + 1, key + "=" + value)
+
+          set_option("keystore/debug", '"' + keystore + '"')
+          set_option("keystore/debug_user", '"androiddebugkey"')
+          set_option("keystore/debug_password", '"android"')
+
+          set_option("keystore/release", '""')
+          set_option("keystore/release_user", '""')
+          set_option("keystore/release_password", '""')
+
+          set_option("package/signed", "true")
+
+          set_option("architectures/arm64-v8a", "true")
+          set_option("architectures/armeabi-v7a", "false")
+          set_option("architectures/x86", "false")
+          set_option("architectures/x86_64", "false")
+
+          set_option("gradle_build/use_gradle_build", "false")
+
+          set_option("version/code", "1")
+          set_option("version/name", '"0.1"')
+
+          set_option("package/unique_name", '"com.gaeagame.runner"')
+          set_option("package/name", '"Gaea Runner"')
+
+          path.write_text("\n".join(lines) + "\n")
+          PY
+
+          echo "Android export preset:"
+          sed -n '/\[preset.0\]/,/^\[preset.1\]/p' export_presets.cfg 2>/dev/null || cat export_presets.cfg
+
+
+      - name: Verify Android export configuration
+        shell: bash
+        run: |
+          set -e
+
+          cd "$GAME_DIR"
+
+          echo "=== Android SDK ==="
+          echo "$ANDROID_HOME"
+
+          echo "=== Java ==="
+          echo "$JAVA_HOME"
+
+          echo "=== Debug keystore ==="
+          echo "$DEBUG_KEYSTORE"
+
+          test -f "$DEBUG_KEYSTORE"
+
+          echo "=== ADB ==="
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          adb start-server
+          adb devices
+
+          echo "=== Export preset ==="
+          grep -E \
+            '^\[preset\.0\]|^name=|^platform=|^keystore/debug=|^keystore/debug_user=|^package/signed=|^architectures/arm64-v8a=|^package/unique_name=|^package/name=' \
+            export_presets.cfg || true
+
+          echo "Configuration verification completed."
+
+
+      - name: Import Godot project
+        shell: bash
+        run: |
+          set -e
+
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+
+          cd "$GAME_DIR"
+
+          echo "Importing Godot project..."
+
+          "$GITHUB_WORKSPACE/godot" \
+            --headless \
+            --editor \
+            --quit \
+            --path . \
+            --import
+
+          echo "Import completed."
+
+
+      - name: Build Android APK
+        shell: bash
+        env:
+          GODOT_ANDROID_KEYSTORE_DEBUG_PATH: ${{ env.DEBUG_KEYSTORE }}
+          GODOT_ANDROID_KEYSTORE_DEBUG_USER: androiddebugkey
+          GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD: android
+        run: |
+          set -e
+
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+
+          adb start-server
+
+          cd "$GAME_DIR"
+
+          mkdir -p build/android
+
+          echo "Building Android APK..."
+
+          "$GITHUB_WORKSPACE/godot" \
+            --headless \
+            --path . \
+            --export-debug "Android" \
+            build/android/GaeaRunner.apk
+
+          echo "APK created successfully!"
+
+          test -f build/android/GaeaRunner.apk
+
+          ls -lh build/android/GaeaRunner.apk
+
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GaeaRunner-APK
+          path: "${{ env.GAME_DIR }}/build/android/GaeaRunner.apk"
+          if-no-files-found: error
