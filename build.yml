@@ -1,0 +1,95 @@
+name: Build Godot APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unpack game.zip
+        shell: bash
+        run: |
+          set -e
+          mkdir -p game
+          unzip -q game.zip -d game
+
+          # If the ZIP has a single top-level folder, enter it.
+          if [ ! -f "game/project.godot" ]; then
+            PROJECT_FILE="$(find game -maxdepth 3 -name project.godot -type f | head -n 1)"
+            if [ -z "$PROJECT_FILE" ]; then
+              echo "project.godot was not found inside game.zip"
+              exit 1
+            fi
+            GAME_DIR="$(dirname "$PROJECT_FILE")"
+          else
+            GAME_DIR="game"
+          fi
+
+          echo "GAME_DIR=$GAME_DIR" >> "$GITHUB_ENV"
+          echo "Using project directory: $GAME_DIR"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android packages
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Download Godot
+        shell: bash
+        run: |
+          set -e
+          GODOT_VERSION="4.6-stable"
+          curl -L \
+            "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}/Godot_v4.6-stable_linux.x86_64.zip" \
+            -o godot.zip
+          unzip -q godot.zip
+          mv Godot_v4.6-stable_linux.x86_64/godot ./
+          chmod +x ./godot
+
+      - name: Download Android export templates
+        shell: bash
+        run: |
+          set -e
+          curl -L \
+            "https://github.com/godotengine/godot-builds/releases/download/4.6-stable/Godot_v4.6-stable_export_templates.tpz" \
+            -o templates.tpz
+          mkdir -p ~/.local/share/godot/export_templates/4.6.stable
+          tar -xf templates.tpz -C ~/.local/share/godot/export_templates/4.6.stable
+          if [ -d ~/.local/share/godot/export_templates/4.6.stable/templates ]; then
+            mv ~/.local/share/godot/export_templates/4.6.stable/templates/* \
+               ~/.local/share/godot/export_templates/4.6.stable/ || true
+            rmdir ~/.local/share/godot/export_templates/4.6.stable/templates || true
+          fi
+
+      - name: Import and build APK
+        shell: bash
+        run: |
+          set -e
+          cd "$GAME_DIR"
+          mkdir -p build/android
+          ../godot --headless --editor --quit --path . --import
+          ../godot --headless --path . \
+            --export-debug "Android" \
+            build/android/GaeaRunner.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GaeaRunner-APK
+          path: "${{ env.GAME_DIR }}/build/android/GaeaRunner.apk"
+          if-no-files-found: error
